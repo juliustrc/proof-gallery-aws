@@ -1,0 +1,282 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Client Proof Gallery backend - CS 79C final project
+
+Parameters:
+  NotifyEmail:
+    Type: String
+    Description: Email address that receives the client favorites list
+  PhotoBucketName:
+    Type: String
+    Description: Globally unique lowercase bucket name, for example proofs-yourname-cs79c-2026
+
+Resources:
+  PhotoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref PhotoBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  GalleryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: galleryId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: galleryId
+          KeyType: HASH
+
+  FavoritesTopic:
+    Type: AWS::SNS::Topic
+
+  FavoritesSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref FavoritesTopic
+      Protocol: email
+      Endpoint: !Ref NotifyEmail
+
+  GalleryLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: gallery-least-privilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt GalleryTable.Arn
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt PhotoBucket.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${PhotoBucket.Arn}/*'
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref FavoritesTopic
+
+  GetGalleryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt GalleryLambdaRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE: !Ref GalleryTable
+          BUCKET: !Ref PhotoBucket
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import time
+          import boto3
+          from botocore.config import Config
+
+          s3 = boto3.client('s3', config=Config(signature_version='s3v4'))
+          table = boto3.resource('dynamodb').Table(os.environ['TABLE'])
+          BUCKET = os.environ['BUCKET']
+
+          def respond(code, body):
+              return {'statusCode': code, 'headers': {'Content-Type': 'application/json'}, 'body': json.dumps(body)}
+
+          def handler(event, context):
+              gallery_id = event['pathParameters']['galleryId']
+              item = table.get_item(Key={'galleryId': gallery_id}).get('Item')
+              if not item:
+                  return respond(404, {'error': 'Gallery not found'})
+              if int(item['expiresAt']) < int(time.time()):
+                  return respond(410, {'error': 'This link has expired'})
+              prefix = 'galleries/' + gallery_id + '/'
+              listing = s3.list_objects_v2(Bucket=BUCKET, Prefix=prefix)
+              photos = []
+              for obj in listing.get('Contents', []):
+                  key = obj['Key']
+                  if key.endswith('/'):
+                      continue
+                  url = s3.generate_presigned_url('get_object', Params={'Bucket': BUCKET, 'Key': key}, ExpiresIn=900)
+                  photos.append({'key': key, 'url': url})
+              return respond(200, {
+                  'clientName': item.get('clientName', ''),
+                  'photos': photos,
+                  'favorites': item.get('favorites', []),
+                  'expiresAt': int(item['expiresAt'])
+              })
+
+  SaveFavoritesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt GalleryLambdaRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE: !Ref GalleryTable
+          TOPIC: !Ref FavoritesTopic
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import time
+          import boto3
+
+          table = boto3.resource('dynamodb').Table(os.environ['TABLE'])
+          sns = boto3.client('sns')
+
+          def respond(code, body):
+              return {'statusCode': code, 'headers': {'Content-Type': 'application/json'}, 'body': json.dumps(body)}
+
+          def handler(event, context):
+              gallery_id = event['pathParameters']['galleryId']
+              item = table.get_item(Key={'galleryId': gallery_id}).get('Item')
+              if not item:
+                  return respond(404, {'error': 'Gallery not found'})
+              if int(item['expiresAt']) < int(time.time()):
+                  return respond(410, {'error': 'This link has expired'})
+              try:
+                  data = json.loads(event.get('body') or '{}')
+              except ValueError:
+                  return respond(400, {'error': 'Bad request body'})
+              favorites = data.get('favorites', [])
+              if not isinstance(favorites, list):
+                  return respond(400, {'error': 'favorites must be a list'})
+              prefix = 'galleries/' + gallery_id + '/'
+              favorites = [f for f in favorites if isinstance(f, str) and f.startswith(prefix)][:200]
+              table.update_item(
+                  Key={'galleryId': gallery_id},
+                  UpdateExpression='SET favorites = :f, submittedAt = :t',
+                  ExpressionAttributeValues={':f': favorites, ':t': int(time.time())}
+              )
+              client = item.get('clientName', 'unknown')
+              names = chr(10).join('- ' + f[len(prefix):] for f in favorites)
+              message = 'Client: ' + client + chr(10) + 'Gallery: ' + gallery_id + chr(10) + 'Favorites (' + str(len(favorites)) + '):' + chr(10) + names
+              sns.publish(TopicArn=os.environ['TOPIC'], Subject=('Proof favorites from ' + client)[:90], Message=message)
+              return respond(200, {'saved': len(favorites)})
+
+  GalleryApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: proof-gallery-api
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - content-type
+
+  GetIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref GalleryApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetGalleryFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  SaveIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref GalleryApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt SaveFavoritesFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  GetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref GalleryApi
+      RouteKey: 'GET /gallery/{galleryId}'
+      Target: !Sub 'integrations/${GetIntegration}'
+
+  SaveRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref GalleryApi
+      RouteKey: 'POST /gallery/{galleryId}/favorites'
+      Target: !Sub 'integrations/${SaveIntegration}'
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref GalleryApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 10
+        ThrottlingRateLimit: 5
+
+  GetInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref GetGalleryFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${GalleryApi}/*/GET/gallery/*'
+
+  SaveInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SaveFavoritesFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${GalleryApi}/*/POST/gallery/*'
+
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: proof-gallery-getgallery-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GetGalleryFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref FavoritesTopic
+
+Outputs:
+  ApiUrl:
+    Value: !Sub 'https://${GalleryApi}.execute-api.${AWS::Region}.amazonaws.com'
+  PhotoBucketName:
+    Value: !Ref PhotoBucket
+  TableName:
+    Value: !Ref GalleryTable
+  TopicArn:
+    Value: !Ref FavoritesTopic
