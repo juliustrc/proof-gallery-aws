@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Client Proof Gallery</title>
+<style>
+body { font-family: system-ui, sans-serif; margin: 0; background: #111; color: #eee; }
+header { padding: 16px 24px; background: #000; }
+h1 { margin: 0; font-size: 1.3rem; }
+.sub { color: #aaa; font-size: 0.9rem; }
+#msg { padding: 16px 24px; }
+#grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; padding: 0 16px 16px; }
+.card { position: relative; cursor: pointer; border: 3px solid transparent; border-radius: 8px; overflow: hidden; }
+.card img { width: 100%; display: block; }
+.card.fav { border-color: #ffd54a; }
+.card.fav::after { content: '★'; position: absolute; top: 6px; right: 10px; color: #ffd54a; font-size: 1.6rem; }
+#bar { padding: 0 16px 32px; }
+button { background: #ffd54a; border: 0; padding: 12px 20px; font-size: 1rem; border-radius: 6px; cursor: pointer; }
+</style>
+</head>
+<body>
+<header>
+<h1>Client Proof Gallery</h1>
+<div class='sub'>Built by JULIO ORNELAS for CS 79C</div>
+</header>
+<div id='msg'>Loading...</div>
+<div id='grid'></div>
+<div id='bar'><button id='send' hidden>Send my favorites</button></div>
+<script>
+const API = 'https://hayfn5tbib.execute-api.us-west-2.amazonaws.com';
+const galleryId = new URLSearchParams(location.search).get('g');
+const msg = document.getElementById('msg');
+const grid = document.getElementById('grid');
+const sendBtn = document.getElementById('send');
+const favorites = new Set();
+async function load() {
+if (!galleryId) { msg.textContent = 'This link is missing its gallery code.'; return; }
+try {
+const res = await fetch(API + '/gallery/' + encodeURIComponent(galleryId));
+const data = await res.json();
+if (!res.ok) { msg.textContent = data.error || 'Something went wrong.'; return; }
+const expires = new Date(data.expiresAt * 1000).toLocaleString();
+msg.textContent = 'Hello ' + data.clientName + '! Tap a photo to mark it as a favorite. This link expires ' + expires + '.';
+data.favorites.forEach(function (f) { favorites.add(f); });
+data.photos.forEach(function (p) {
+const card = document.createElement('div');
+card.className = 'card' + (favorites.has(p.key) ? ' fav' : '');
+const img = document.createElement('img');
+img.src = p.url;
+img.alt = 'Proof photo';
+card.appendChild(img);
+card.onclick = function () {
+if (favorites.has(p.key)) { favorites.delete(p.key); } else { favorites.add(p.key); }
+card.classList.toggle('fav');
+};
+grid.appendChild(card);
+});
+sendBtn.hidden = false;
+} catch (err) {
+msg.textContent = 'Could not reach the gallery service.';
+}
+}
+sendBtn.onclick = async function () {
+try {
+const res = await fetch(API + '/gallery/' + encodeURIComponent(galleryId) + '/favorites', {
+method: 'POST',
+headers: { 'Content-Type': 'application/json' },
+body: JSON.stringify({ favorites: Array.from(favorites) })
+});
+const data = await res.json();
+msg.textContent = res.ok ? 'Sent! ' + data.saved + ' favorites saved.' : (data.error || 'Could not save.');
+} catch (err) {
+msg.textContent = 'Could not send favorites.';
+}
+};
+load();
+</script>
+</body>
+</html>
